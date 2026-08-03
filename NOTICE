@@ -1,0 +1,22 @@
+ComfyUI-SolAttn-Ampere
+Copyright 2026 ComfyUI-SolAttn-Ampere contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+------------------------------------------------------------------------
+This product includes work derived from the following Apache-2.0 project.
+------------------------------------------------------------------------
+
+Sol-Attn
+  Copyright NVIDIA Corporation (NVlabs)
+  https://github.com/NVlabs/Sana  (branch: sol-engine)
+  https://nvlabs.github.io/Sana/Sol-Attn/
+  Licensed under the Apache License, Version 2.0.
+
+  The block-sparse attention algorithm implemented here -- 128-token block
+  mean pooling, the q-bar/k-c pilot score, and the mean + tau*std routing
+  threshold -- originates from Sol-Attn:
+
+    Sol-Attn: Accelerating Video Generation Inference via On-the-Fly
+    Attention Sparsification
+    arXiv:2607.24027
