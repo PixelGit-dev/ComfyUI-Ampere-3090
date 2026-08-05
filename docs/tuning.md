@@ -6,14 +6,17 @@ Wire the decoded `IMAGE` into **Sol-Attn Stats** → `trigger` so it reads after
 that input ComfyUI may execute it before the sampler and report zeros.
 
 ```
-sol_attn=1000  skipped_short=0  skipped_shape=0  failed=0  last_density=0.1689
+sol_attn=768  skipped_short=0  skipped_shape=0  skipped_early=200 skipped_block=32 prefix_blocks=8 failed=0 last_density=0.1689
 ```
 
 | Field | Meaning |
 |---|---|
-| `sol_attn` | Calls that used the sparse kernel. Should equal *blocks x steps* (H3 has 50 blocks). |
+| `sol_attn` | Calls that used the sparse kernel after the dense quality guards. |
 | `skipped_short` | Fell through because `S < min_seq_len`. |
 | `skipped_shape` | Not H3 self-attention — cross-attention, wrong dtype, masked. Some is normal. |
+| `skipped_early` | Dense calls from `dense_first_percent`. |
+| `skipped_block` | Dense calls from `dense_first_blocks`. |
+| `prefix_blocks` | Exact 128-token prefix blocks on the last sparse call. Nonzero confirms automatic protection. |
 | `failed` | Kernel raised and fell back. Should be 0. |
 | `last_density` | Fraction of KV blocks kept on the last call. **The number that matters.** |
 
@@ -52,9 +55,20 @@ artifacts. Change one variable at a time and read the density log rather than tr
 only ~1.5x at 4k tokens and routing overhead is real, so SageAttention wins on short sequences.
 Lower it only if you have measured that it helps.
 
-**`preserve_prefix_blocks`** (default 0) — force-keep the first N 128-token blocks. H3 packs the
-sequence as `[text | cond | audio | video]`, so this protects the text prefix from pruning. Try
-`8–16` if prompt adherence degrades. Costs a little speed.
+**`protect_prefix`** (default true) — derives H3's full non-video prefix from the target-video token
+count and keeps those KV blocks exact. This protects text, conditioning/reference rows and audio.
+
+**`dense_prefix_queries`** (default false) — also lets prefix query rows attend all KV blocks. Turn
+this on if prompt adherence or audio/video synchronization still degrades.
+
+**`dense_first_percent`** (default 0.2) — keeps early high-noise denoising dense. The released H3
+policy uses the first 20%.
+
+**`dense_first_blocks`** (default 2) — keeps the first two of H3's 50 transformer blocks dense on
+every step, matching the released H3 policy.
+
+**`preserve_prefix_blocks`** (default 0) — a manual minimum. Normally leave it at zero and let
+`protect_prefix` calculate the span.
 
 **`log_every`** (default 200) — density logging interval. 0 disables.
 
@@ -64,8 +78,8 @@ Sol-Attn is lossy in a way SageAttention is not — at density 0.20 you are drop
 blocks. The failure mode specific to H3 is **audio-video sync**: video, audio and text share one
 sequence, so block pruning can sever cross-modal attention in a way no speed benchmark reveals.
 
-If output degrades, in order: lower `tau`, then set `preserve_prefix_blocks` to `8–16`, then compare
-against a bypassed run at the same seed.
+If output degrades, in order: enable `dense_prefix_queries`, lower `tau`, increase
+`dense_first_percent`, then compare against a bypassed run at the same seed.
 
 ## Troubleshooting
 

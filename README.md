@@ -57,7 +57,11 @@ A complete FL2VA workflow is in
 |---|---|---|
 | `tau` | 1.2 | Sparsity. Higher = faster, less accurate. 1.0–1.5 is speed-first. |
 | `min_seq_len` | 8192 | Below this, fall through to normal attention (SageAttention wins there). |
-| `preserve_prefix_blocks` | 0 | Force-keep the first N blocks — protects H3's text prefix. |
+| `protect_prefix` | true | Keep the complete text/conditioning/reference/audio prefix exact automatically. |
+| `dense_prefix_queries` | false | Also run prefix query rows densely for the strongest conditioning guard. |
+| `dense_first_percent` | 0.2 | Keep the first 20% of denoising dense, matching the reference H3 policy. |
+| `dense_first_blocks` | 2 | Keep H3's first two transformer blocks dense on every step. |
+| `preserve_prefix_blocks` | 0 | Optional manual minimum when automatic prefix detection is unavailable. |
 | `log_every` | 200 | Log measured density every N calls. |
 
 **Sol-Attn Stats** — reports whether the kernel actually ran. Wire the decoded `IMAGE` into `trigger`
@@ -70,7 +74,8 @@ Tuning guidance and troubleshooting: [docs/tuning.md](docs/tuning.md).
 
 Intercepts MiniMax H3 self-attention only — pre-reshaped BHSD, head_dim 128, unmasked, bf16/fp16.
 Cross-attention, other dtypes, and short sequences pass through untouched. Any kernel failure falls
-back rather than aborting the generation.
+back rather than aborting the generation. If another attention override was installed earlier in
+the MODEL chain, it remains the fallback.
 
 ## Docs
 

@@ -18,34 +18,36 @@ Implementation notes:
 
 * **Operates natively in BHSD** ``[B, H, S, D]`` -- the layout MiniMax H3 hands
   us and the one flex_attention wants, so q/k/v are never permuted.
-* **Index packing ranks selected blocks as ``idx + 1``** rather than
-  ``selected * idx``, so a selected block 0 stays distinguishable from the
-  unselected zeros and survival does not depend on sort tie-breaking.  Reading
-  ids from ``sort(...).values`` also avoids an int64 ``argsort`` index tensor
-  (193 MB at N=656).
-* **Head-chunked routing** so the transient sort workspace stays bounded at
+* **Linear-time index packing** uses an int32 prefix sum and scatter-add rather
+  than sorting every routing row.
+* **Head-chunked routing** so dense pilot-score intermediates stay bounded at
   long sequences.
 * **fp16 tolerated** in addition to bf16.
+* **No full-tensor repacking or padding.** FlexAttention accepts H3's strided
+  BHSD views and arbitrary sequence lengths; only the small block summaries
+  are materialized.
 """
 
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 
 import torch
-import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
 # flex_attention's compiled kernel requires 128-token blocks.
 FLEX_BLOCK = 128
 
-# Cap on heads processed per routing chunk; keeps the [b, hc, N, N] sort
-# workspace small at long sequences.
+# Cap on heads processed per routing chunk; keeps the [b, hc, N, N] pilot
+# score and packing workspace small at long sequences.
 _MAX_ROUTE_ELEMS = 8 * 656 * 656
 
 _compiled_flex = None
 _last_density = None
+_geometry_cache = OrderedDict()
+_MAX_GEOMETRIES = 4
 
 
 def _get_compiled_flex():
@@ -58,29 +60,82 @@ def _get_compiled_flex():
 
 def last_density() -> float | None:
     """Fraction of KV blocks kept on the most recent call (None if unused)."""
-    return _last_density
+    if _last_density is None:
+        return None
+    # Keep this synchronization out of the hot path.  The caller only asks on
+    # an occasional log line or after sampling has completed.
+    return float(_last_density.detach().item())
 
 
-def _build_routing(q_h, k_h, tau, preserve_prefix_blocks):
+def _routing_geometry(device, blocks):
+    """Return cached block ids and the exact local window for this shape."""
+    key = (device.type, device.index, blocks)
+    cached = _geometry_cache.get(key)
+    if cached is not None:
+        _geometry_cache.move_to_end(key)
+        return cached
+
+    ids = torch.arange(blocks, device=device, dtype=torch.int32)
+    local = (ids.view(blocks, 1) - ids.view(1, blocks)).abs() <= 1
+    _geometry_cache[key] = (ids, local)
+    if len(_geometry_cache) > _MAX_GEOMETRIES:
+        _geometry_cache.popitem(last=False)
+    return ids, local
+
+
+def _pool_blocks(x):
+    """Mean-pool a possibly strided BHSD tensor without padding/copying it."""
+    B, H, T, D = x.shape
+    full = T // FLEX_BLOCK
+    pieces = []
+    if full:
+        body = x[:, :, :full * FLEX_BLOCK, :]
+        pieces.append(
+            body.view(B, H, full, FLEX_BLOCK, D).mean(
+                dim=3, dtype=torch.float32
+            )
+        )
+    if full * FLEX_BLOCK != T:
+        pieces.append(
+            x[:, :, full * FLEX_BLOCK:, :].mean(
+                dim=2, dtype=torch.float32, keepdim=True
+            )
+        )
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=2)
+
+
+def _pack_selected(selected, block_ids):
+    """Pack selected KV ids in ascending order using O(N) row operations."""
+    counts = selected.sum(dim=-1, dtype=torch.int32)
+    positions = selected.cumsum(dim=-1, dtype=torch.int32).sub_(1).clamp_min_(0)
+    source = torch.where(selected, block_ids, 0)
+    packed = torch.zeros_like(positions)
+    # Selected ids have unique destinations. Unselected entries only add zero,
+    # including the block-0 case, so collisions are harmless and deterministic.
+    packed.scatter_add_(-1, positions, source)
+    return counts, packed
+
+
+def _build_routing(q_h, k_h, tau, preserve_prefix_blocks,
+                   dense_prefix_queries):
     """Sol-Attn diag routing.
 
-    q_h, k_h: [B, H, T_pad, D].  Returns (kv_num_blocks, kv_indices, density).
+    q_h, k_h: [B, H, T, D].  Returns (kv_num_blocks, kv_indices, density).
 
     A KV block is kept when its pilot score ``q_bar @ kc`` exceeds
     ``mean + tau * std`` of the score distribution, plus a local diagonal
     window that is always exact.
     """
-    B, H, T_pad, D = q_h.shape
-    N = T_pad // FLEX_BLOCK
+    B, H, T, D = q_h.shape
+    N = (T + FLEX_BLOCK - 1) // FLEX_BLOCK
     dev = q_h.device
 
-    # 128-token block means, in fp32 -- the variance term is numerically poor
-    # in bf16 and this tensor is small ([B, H, N, D]).
-    kc_all = k_h.view(B, H, N, FLEX_BLOCK, D).mean(dim=3).float()
-    qb_all = q_h.view(B, H, N, FLEX_BLOCK, D).mean(dim=3).float()
+    # Direct fp32 accumulation avoids bf16 variance noise. The partial tail is
+    # divided by its real token count rather than by a zero-padded 128.
+    kc_all = _pool_blocks(k_h)
+    qb_all = _pool_blocks(q_h)
 
-    blk = torch.arange(N, device=dev, dtype=torch.int32)
-    diag = (blk.view(N, 1) - blk.view(1, N)).abs() <= 1  # [N, N]
+    blk, diag = _routing_geometry(dev, N)
 
     kv_num_blocks = torch.empty(B, H, N, dtype=torch.int32, device=dev)
     kv_indices = torch.empty(B, H, N, N, dtype=torch.int32, device=dev)
@@ -104,20 +159,18 @@ def _build_routing(q_h, k_h, tau, preserve_prefix_blocks):
             # Text (and, at larger values, cond/audio) rows are a contiguous
             # prefix in H3's packed layout: [text | cond | audio | video].
             sel[..., :preserve_prefix_blocks] = True
+            if dense_prefix_queries:
+                sel[..., :preserve_prefix_blocks, :] = True
 
-        kv_num_blocks[:, h0:h1] = sel.sum(-1).to(torch.int32)
+        counts, packed = _pack_selected(sel, blk)
+        kv_num_blocks[:, h0:h1] = counts
+        kv_indices[:, h0:h1] = packed
 
-        # Pack selected block ids to the front.  rank = idx+1 for selected,
-        # 0 otherwise, so a selected block 0 (rank 1) still outranks every
-        # unselected block.  Sorting descending then subtracting 1 recovers
-        # the ids; trailing garbage sits past kv_num_blocks and is never read.
-        rank = torch.where(sel, blk + 1, torch.zeros_like(blk))
-        vals = torch.sort(rank, dim=-1, descending=True).values
-        kv_indices[:, h0:h1] = (vals - 1).clamp_min_(0)
+        del score, sel, counts, packed
 
-        del score, sel, rank, vals
-
-    density = kv_num_blocks.float().mean().item() / N
+    # Leave density on-device. Calling .item() here serialized every attention
+    # layer with the CPU even when density logging was infrequent.
+    density = kv_num_blocks.sum(dtype=torch.float32) / float(B * H * N * N)
     return kv_num_blocks, kv_indices, density
 
 
@@ -129,6 +182,7 @@ def sol_attn_flex(
     scale: float | None = None,
     tau: float = 1.2,
     preserve_prefix_blocks: int = 0,
+    dense_prefix_queries: bool = False,
 ) -> torch.Tensor:
     """Block-sparse attention over BHSD tensors ``[B, H, S, D]``.
 
@@ -150,37 +204,23 @@ def sol_attn_flex(
     if T == 0:
         return q.clone()
 
-    T_pad = ((T + FLEX_BLOCK - 1) // FLEX_BLOCK) * FLEX_BLOCK
-    if T_pad != T:
-        pad = (0, 0, 0, T_pad - T)  # pad the S dim of [B, H, S, D]
-        qp, kp, vp = F.pad(q, pad), F.pad(k, pad), F.pad(v, pad)
-    else:
-        qp, kp, vp = q, k, v
-
-    qp = qp.contiguous()
-    kp = kp.contiguous()
-    vp = vp.contiguous()
-
     kv_num_blocks, kv_indices, density = _build_routing(
-        qp, kp, tau, preserve_prefix_blocks
+        q, k, tau, preserve_prefix_blocks, dense_prefix_queries
     )
     _last_density = density
 
     from torch.nn.attention.flex_attention import BlockMask
 
-    def boundary(b, h, q_idx, kv_idx):
-        # Zero-padded rows/cols would otherwise score 0 (not -inf) and leak in.
-        return (q_idx < T) & (kv_idx < T)
-
     block_mask = BlockMask.from_kv_blocks(
         kv_num_blocks, kv_indices,
         BLOCK_SIZE=FLEX_BLOCK,
-        mask_mod=boundary,
-        seq_lengths=(T_pad, T_pad),
+        seq_lengths=(T, T),
+        # Q-side metadata is only used by backward. Building it transposes and
+        # repacks the complete sparse map, which is wasted during inference.
+        compute_q_blocks=False,
     )
 
-    out = _get_compiled_flex()(qp, kp, vp, block_mask=block_mask, scale=scale)
-    return out[:, :, :T, :]
+    return _get_compiled_flex()(q, k, v, block_mask=block_mask, scale=scale)
 
 
 def warmup(device=None) -> bool:
@@ -190,16 +230,23 @@ def warmup(device=None) -> bool:
     if device.type != "cuda":
         return False
     try:
-        from torch.nn.attention.flex_attention import create_block_mask
+        from torch.nn.attention.flex_attention import BlockMask
         B, H, T, D = 1, 1, 256, 128
-        q = torch.randn(B, H, T, D, device=device, dtype=torch.bfloat16)
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-
-        def noop(b, h, qi, kv):
-            return qi >= 0
-
-        bm = create_block_mask(noop, B, H, T, T, device=device, BLOCK_SIZE=FLEX_BLOCK)
+        qkv = torch.randn(B, T, 3 * H * D, device=device, dtype=torch.bfloat16)
+        q, k, v = (
+            part.view(B, T, H, D).transpose(1, 2)
+            for part in qkv.split(H * D, dim=-1)
+        )
+        blocks = T // FLEX_BLOCK
+        counts = torch.full((B, H, blocks), blocks, device=device, dtype=torch.int32)
+        indices = torch.arange(blocks, device=device, dtype=torch.int32)
+        indices = indices.view(1, 1, 1, blocks).expand(
+            B, H, blocks, blocks
+        ).contiguous()
+        bm = BlockMask.from_kv_blocks(
+            counts, indices, BLOCK_SIZE=FLEX_BLOCK, seq_lengths=(T, T),
+            compute_q_blocks=False,
+        )
         _get_compiled_flex()(q, k, v, block_mask=bm)
         torch.cuda.synchronize(device)
         logger.info("[Sol-Attn] flex_attention compiled (warmup done)")

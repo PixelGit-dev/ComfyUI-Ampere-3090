@@ -25,11 +25,13 @@ each KV block with `q̄ @ k̄ᵀ`, and keep blocks whose score exceeds `mean + t
 distribution. A `|i-j| <= 1` diagonal window is always kept so local attention is exact.
 
 **Packing.** `flex_attention`'s `BlockMask` wants, per query block, the selected KV block ids packed
-to the front plus a count. We rank selected blocks as `idx + 1` and unselected as `0`, sort
-descending, and subtract 1 — the trailing garbage sits past `kv_num_blocks` and is never read.
+to the front plus a count. An int32 prefix sum assigns each selected block its output position and
+`scatter_add_` writes the ids in ascending order. This is linear in the number of blocks per row;
+the old implementation sorted every row.
 
-**Execution.** `BlockMask.from_kv_blocks(...)` with a boundary `mask_mod`, then
-`torch.compile(flex_attention)`. 128 is the kernel's minimum block size.
+**Execution.** `BlockMask.from_kv_blocks(...)`, then `torch.compile(flex_attention)`. The real
+sequence length is passed directly, so FlexAttention handles the final partial block without
+padding Q/K/V. Q-side mask metadata is disabled because it is only needed for backward.
 
 ## How the hook attaches
 
@@ -41,29 +43,30 @@ otherwise run — so the fallback path lands on SageAttention when ComfyUI was s
 MiniMax H3's self-attention (`comfy/ldm/minimax/model.py:178-182`) passes `q/k/v` as
 `[1, heads, S, 128]` with `skip_reshape=True`, and expects `[1, S, heads*128]` back.
 
-The node clones the ModelPatcher and installs the override into `transformer_options`. No weights
-are touched.
+The node clones the ModelPatcher and installs the override into `transformer_options`. A lightweight
+diffusion wrapper publishes the target-video token count so the override can derive the complete
+non-video prefix. No weights are touched.
 
 ## Design notes
 
 **BHSD throughout.** H3 hands the hook `[B, H, S, D]` and `flex_attention` wants the same layout, so
-nothing is permuted. Converting to BTHD and back would cost two full contiguous copies of q/k/v per
-call — ~1.2 GB each at 84k tokens — for no benefit.
+nothing is permuted or made contiguous. PyTorch FlexAttention accepts these last-dimension-contiguous
+strided views. Avoiding Q/K/V padding and repacking removes three full-sequence copies per call.
 
 **Head-chunked routing.** The routing intermediates are `[B, H, N, N]`; at 84k tokens N=656 and a
-full-width sort workspace runs into the hundreds of MB. Heads are processed in chunks to bound it.
+full-width workspace runs into the hundreds of MB. Heads are processed in chunks to bound it.
 
-**Index packing avoids `argsort`.** `BlockMask` needs the selected block ids packed to the front of
-each row. The obvious formulation ranks blocks as `selected * block_idx` and recovers ids with
-`argsort` + `gather`, but that has two problems: a *selected* block 0 ranks as `0`, identical to
-every *unselected* block, so its survival depends on tie-breaking — and `torch.argsort` does not
-guarantee stability without `stable=True`.
+**Index packing is sort-free.** `BlockMask` needs selected block ids packed to the front of each row.
+An int32 cumulative count gives every selected id a unique destination. Unselected entries scatter
+zero, so collisions are harmless, including when block 0 is selected.
 
-In practice the tie resolves favourably (tested across 6 selection patterns on torch 2.12 / CUDA,
-block 0 survived every time, because ties fall back to original order). It is still relying on
-unspecified behaviour. Ranking as `idx + 1` and reading ids out of `sort(...).values` removes the
-dependency, and skips materialising the int64 `order` tensor that `gather` would need — 193 MB at
-N=656.
+**Density is lazy.** The density stays as a CUDA scalar until a periodic log line or the stats node
+actually asks for it. The old `.item()` in every layer synchronized the GPU with Python even when
+logging was disabled.
+
+**Reference H3 quality guards.** The first portion of sampling and first blocks per step can stay
+dense. The complete `[text | conditioning/reference | audio]` prefix is detected from the target
+video length and forced exact as KV. Prefix query rows can optionally be dense as well.
 
 **fp16 accepted** alongside bf16. H3 is bf16-only in ComfyUI (`supported_models.py:973` lists
 `[bfloat16, float32]`), but the check costs nothing and `flex_attention` handles fp16 fine.
