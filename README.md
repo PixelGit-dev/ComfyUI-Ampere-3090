@@ -19,19 +19,6 @@ entirely: it removes operations rather than making each one cheaper.
 
 See [docs/why.md](docs/why.md) for the full analysis.
 
-## Results
-
-Measured on an RTX 3090 at MiniMax H3's real attention shape, routing overhead included:
-
-| Tokens | SageAttention 2.2 | Sol-Attn | Density | Speedup |
-|---|---|---|---|---|
-| 12,288 | 52.8 ms | 16.6 ms | 0.143 | 3.18x |
-| 32,768 | 368.5 ms | 93.3 ms | 0.125 | 3.95x |
-
-**Caveat:** those densities come from random tensors. In a real generation (S=17627, `tau=1.2`)
-measured density was **0.17–0.21**, so expect less than the table suggests. Full numbers and the
-still-missing A/B baseline are in [docs/benchmarks.md](docs/benchmarks.md).
-
 ## Install
 
 Drop the folder into `ComfyUI/custom_nodes/`. No dependencies beyond PyTorch — `flex_attention`
@@ -53,16 +40,26 @@ A complete FL2VA workflow is in
 
 **Sol-Attn MiniMax H3** — patches the model.
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `tau` | 1.2 | Sparsity. Higher = faster, less accurate. 1.0–1.5 is speed-first. |
-| `min_seq_len` | 8192 | Below this, fall through to normal attention (SageAttention wins there). |
-| `protect_prefix` | true | Keep the complete text/conditioning/reference/audio prefix exact automatically. |
-| `dense_prefix_queries` | false | Also run prefix query rows densely for the strongest conditioning guard. |
-| `dense_first_percent` | 0.2 | Keep the first 20% of denoising dense, matching the reference H3 policy. |
-| `dense_first_blocks` | 2 | Keep H3's first two transformer blocks dense on every step. |
-| `preserve_prefix_blocks` | 0 | Optional manual minimum when automatic prefix detection is unavailable. |
-| `log_every` | 200 | Log measured density every N calls. |
+| Parameter                | Default    | Meaning                                                                             |
+| ------------------------ | ---------- | ----------------------------------------------------------------------------------- |
+| `tau`                    | 1.2        | Sparsity. Higher = faster, less accurate. 1.0–1.5 is speed-first.                   |
+| `min_seq_len`            | 8192       | Below this, fall through to normal attention (SageAttention wins there).            |
+| `protect_prefix`         | true       | Keep the complete text/conditioning/reference/audio prefix exact automatically.     |
+| `dense_prefix_queries`   | false      | Also run prefix query rows densely for the strongest conditioning guard.            |
+| `dense_first_percent`    | 0.2        | Keep the first 20% of denoising dense, matching the reference H3 policy.            |
+| `dense_first_blocks`     | 2          | Keep H3's first two transformer blocks dense on every step.                         |
+| `end_percent`            | 1.0        | Return to dense after this fraction of denoising. 1.0 disables; try 0.9.            |
+| `dense_blocks`           | `""`       | Blocks to keep dense, e.g. `0-2,-1`. Overrides `dense_first_blocks`.                |
+| `approx_correction`      | true       | Fold skipped blocks back in via their pilot scores instead of dropping them.        |
+| `cornish_fisher`         | false      | Correct the routing threshold for score skew/kurtosis instead of assuming Gaussian. |
+| `morton`                 | false      | Z-order the video tokens so each block is a compact 3D neighbourhood.               |
+| `morton_curve`           | `2d_frame` | `2d_frame` orders within each frame; `3d` interleaves t/h/w.                        |
+| `preserve_prefix_blocks` | 0          | Optional manual minimum when automatic prefix detection is unavailable.             |
+| `log_every`              | 200        | Log measured density every N calls.                                                 |
+
+The last six are new and default to preserving previous behaviour, except
+`approx_correction`, which is on because dropping the long tail was a quality
+regression against the published method. See [docs/tuning.md](docs/tuning.md).
 
 **Sol-Attn Stats** — reports whether the kernel actually ran. Wire the decoded `IMAGE` into `trigger`
 so it reads *after* sampling. `sol_attn=0` means it never engaged; `last_density > 0.35` means little
@@ -94,10 +91,8 @@ score, and the `mean + tau·std` threshold) is theirs.
 - Project page: <https://nvlabs.github.io/Sana/Sol-Attn/>
 - Code: [NVlabs/Sana](https://github.com/NVlabs/Sana/tree/sol-engine), `sol-engine` branch
 
-**This is a partial implementation.** Sol-Attn also specifies an approximate-correction step —
-reusing below-threshold proxy scores to recover the long-tail contribution of skipped blocks —
-which is not implemented here. Blocks below threshold are dropped outright. Expect quality below
-what the paper reports.
+Sol-Attn's approximate-correction step — reusing below-threshold proxy scores to recover the
+long-tail contribution of skipped blocks — is now implemented (`approx_correction`, on by default).
 
 ## License
 

@@ -6,7 +6,7 @@ Wire the decoded `IMAGE` into **Sol-Attn Stats** → `trigger` so it reads after
 that input ComfyUI may execute it before the sampler and report zeros.
 
 ```
-sol_attn=768  skipped_short=0  skipped_shape=0  skipped_early=200 skipped_block=32 prefix_blocks=8 failed=0 last_density=0.1689
+sol_attn=768  skipped_short=0  skipped_shape=0  skipped_early=200 skipped_late=0 skipped_block=32 prefix_blocks=8 failed=0 last_density=0.1689
 ```
 
 | Field | Meaning |
@@ -15,7 +15,8 @@ sol_attn=768  skipped_short=0  skipped_shape=0  skipped_early=200 skipped_block=
 | `skipped_short` | Fell through because `S < min_seq_len`. |
 | `skipped_shape` | Not H3 self-attention — cross-attention, wrong dtype, masked. Some is normal. |
 | `skipped_early` | Dense calls from `dense_first_percent`. |
-| `skipped_block` | Dense calls from `dense_first_blocks`. |
+| `skipped_late` | Dense calls from `end_percent`. Zero unless you lowered it below 1.0. |
+| `skipped_block` | Dense calls from `dense_first_blocks` / `dense_blocks`. |
 | `prefix_blocks` | Exact 128-token prefix blocks on the last sparse call. Nonzero confirms automatic protection. |
 | `failed` | Kernel raised and fell back. Should be 0. |
 | `last_density` | Fraction of KV blocks kept on the last call. **The number that matters.** |
@@ -65,7 +66,37 @@ this on if prompt adherence or audio/video synchronization still degrades.
 policy uses the first 20%.
 
 **`dense_first_blocks`** (default 2) — keeps the first two of H3's 50 transformer blocks dense on
-every step, matching the released H3 policy.
+every step, matching the released H3 policy. Ignored when `dense_blocks` is set.
+
+**`end_percent`** (default 1.0) — returns to dense attention after this fraction of denoising. 1.0
+disables the gate entirely. The last steps set fine detail, which is where routing error shows most;
+`0.9` is a cheap thing to try if late-run detail looks mushy.
+
+**`dense_blocks`** (default empty) — block indices to keep dense, as a spec string: `0-2,-1` is the
+first three and the last. Negative indices count from the end. Overrides `dense_first_blocks`. The
+first *and last* blocks are the most approximation-sensitive — the last one's error reaches the
+output with no later block to absorb it — which the `dense_first_blocks` integer cannot express.
+
+**`approx_correction`** (default true) — folds skipped blocks back in using the pilot scores routing
+already computed, rather than dropping them. This is Sol-Attn's long-tail correction step and was
+previously missing here. It costs a couple of extra matmuls and a `[B,H,S,N]` intermediate per call;
+it usually pays for itself by letting you raise `tau`. Turn it off to reproduce the old behaviour.
+
+**`cornish_fisher`** (default false) — corrects the routing threshold for the skew and excess
+kurtosis of the score distribution instead of assuming it is Gaussian. Nearly free. It changes
+*which* blocks are kept at a given `tau`, so re-read the density log and re-tune `tau` after
+enabling it — do not assume your old `tau` means the same thing.
+
+**`morton`** (default false) — Z-orders the video tokens so each 128-token block is a compact 3D
+neighbourhood instead of a thin strip of one frame. Exactly neutral for dense attention; it changes
+only what the router sees. Expect a lower density at the same `tau`, or better quality at the same
+density. Requires the layout hooks to resolve H3's video segment; if they cannot, it logs once and
+stays inactive rather than guessing.
+
+**`morton_curve`** (default `2d_frame`) — `2d_frame` Z-orders within each frame and leaves frame
+order alone. `3d` interleaves t/h/w equally, which is spatially tighter but groups ~5 latent frames
+per block; with H3's non-uniform `FRAME_PER_TOKEN = (1, 4, 4, 4, 4)` that can span ~17 real frames,
+so `2d_frame` is the default. Try `3d` only if you have compared them.
 
 **`preserve_prefix_blocks`** (default 0) — a manual minimum. Normally leave it at zero and let
 `protect_prefix` calculate the span.
@@ -78,8 +109,16 @@ Sol-Attn is lossy in a way SageAttention is not — at density 0.20 you are drop
 blocks. The failure mode specific to H3 is **audio-video sync**: video, audio and text share one
 sequence, so block pruning can sever cross-modal attention in a way no speed benchmark reveals.
 
-If output degrades, in order: enable `dense_prefix_queries`, lower `tau`, increase
-`dense_first_percent`, then compare against a bypassed run at the same seed.
+If output degrades, in order: confirm `approx_correction` is on, enable `dense_prefix_queries`, lower
+`tau`, increase `dense_first_percent`, set `dense_blocks` to `0-2,-1`, then compare against a
+bypassed run at the same seed.
+
+If you want more speed rather than more quality, the ordering is different: turn on `morton`, then
+raise `tau` until density lands in the 0.10–0.20 band. Morton and the correction both buy quality
+*per unit density*, which is only useful if you spend it.
+
+Change one thing at a time. `cornish_fisher` and `morton` both change what a given `tau` means, so
+changing either together with `tau` tells you nothing.
 
 ## Troubleshooting
 

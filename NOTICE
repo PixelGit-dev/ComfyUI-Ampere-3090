@@ -14,9 +14,38 @@ Sol-Attn
   Licensed under the Apache License, Version 2.0.
 
   The block-sparse attention algorithm implemented here -- 128-token block
-  mean pooling, the q-bar/k-c pilot score, and the mean + tau*std routing
-  threshold -- originates from Sol-Attn:
+  mean pooling, the q-bar/k-c pilot score, the mean + tau*std routing
+  threshold, and the approximate correction that folds below-threshold blocks
+  back in via their proxy scores -- originates from Sol-Attn:
 
     Sol-Attn: Accelerating Video Generation Inference via On-the-Fly
     Attention Sparsification
     arXiv:2607.24027
+
+------------------------------------------------------------------------
+Independently developed, with acknowledgement.
+------------------------------------------------------------------------
+
+kijai/ComfyUI-SolAttn_triton
+  https://github.com/kijai/ComfyUI-SolAttn_triton
+
+  A Triton implementation of Sol-Attn for ComfyUI.  No code from it is used
+  here -- that repository publishes no license, and this project's backend is
+  torch flex_attention rather than Triton -- but reading it is what prompted
+  four things in this implementation, and the credit for noticing them is
+  theirs:
+
+    * Morton (Z-order) reordering of the video span, so an attention block is
+      a compact 3D neighbourhood rather than a thin strip of one frame, and
+      the observation that a model with non-uniform frame spacing wants a
+      per-frame 2D curve rather than a 3D one.
+    * Applying Sol-Attn's approximate correction on top of a block-sparse
+      executor by merging it with the exact partial softmax.
+    * A Cornish-Fisher expansion of the routing quantile in place of the
+      plain Gaussian one.
+    * Publishing the true transformer block index from module hooks, and the
+      observation that the last block is as approximation-sensitive as the
+      first.
+
+  The implementations of all four here were written against this project's
+  own flex_attention backend and ComfyUI's MiniMax H3 source.

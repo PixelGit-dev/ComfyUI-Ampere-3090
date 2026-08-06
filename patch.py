@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 
 import torch
 
-from sol_attn_flex import sol_attn_flex, last_density
+from sol_attn_flex import sol_attn_flex, last_density, FLEX_BLOCK
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ STATS = {
     "skipped_short": 0,
     "skipped_shape": 0,
     "skipped_early": 0,
+    "skipped_late": 0,
     "skipped_block": 0,
     "prefix_blocks": 0,
     "failed": 0,
@@ -41,6 +43,8 @@ STATS = {
 _VIDEO_TOKENS_KEY = "sol_attn_ampere_video_tokens"
 _SIGMA_KEY = "sol_attn_ampere_sigma"
 _LAYOUT_WRAPPER_KEY = "sol_attn_ampere_layout"
+_BLOCK_INDEX_KEY = "sol_attn_block"
+_BLOCK_INDEX_FLAG = "_sol_attn_block_index_hooked"
 
 
 def reset_stats():
@@ -48,13 +52,63 @@ def reset_stats():
         STATS[key] = 0
 
 
+def parse_blocks(spec, count):
+    """Parse ``"0-2,-1"`` into absolute block indices; negatives count from the end."""
+    out = set()
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        match = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
+        if match is None:
+            raise ValueError(f"cannot parse block spec {part!r}; "
+                             "use indices and ranges like '0-2,-1'")
+        first = int(match.group(1))
+        last = first if match.group(2) is None else int(match.group(2))
+        first = first if first >= 0 else count + first
+        last = last if last >= 0 else count + last
+        if first > last:
+            first, last = last, first
+        out.update(range(max(first, 0), min(last, count - 1) + 1))
+    return frozenset(out)
+
+
+def _install_block_index(diffusion_model):
+    """Publish the running transformer block index into transformer_options.
+
+    Counting attention calls and taking the result modulo a hardcoded block
+    count guesses wrong the moment anything else issues an attention call, or
+    the model has a different depth.  A pre-hook per block is exact.
+    """
+    blocks = getattr(diffusion_model, "blocks", None)
+    if blocks is None:
+        return 0
+    # Marked on the model, not in an id() set -- see morton_h3.install_h3_hooks.
+    if getattr(diffusion_model, _BLOCK_INDEX_FLAG, False):
+        return len(blocks)
+
+    def make_hook(index):
+        def hook(_module, _args, kwargs):
+            options = kwargs.get("transformer_options")
+            if isinstance(options, dict):
+                options[_BLOCK_INDEX_KEY] = index
+            return None
+        return hook
+
+    for index, block in enumerate(blocks):
+        block.register_forward_pre_hook(make_hook(index), with_kwargs=True)
+    setattr(diffusion_model, _BLOCK_INDEX_FLAG, True)
+    return len(blocks)
+
+
 class _RoutingPolicy:
     """Track H3 sampling progress and block position without patching the model."""
 
-    def __init__(self, dense_first_percent, dense_first_blocks,
-                 sigma_hi, sigma_lo, blocks_per_step=50):
+    def __init__(self, dense_first_percent, end_percent, dense_first_blocks,
+                 dense_block_set, sigma_hi, sigma_lo, blocks_per_step=50):
         self.dense_first_percent = float(dense_first_percent)
+        self.end_percent = float(end_percent)
         self.dense_first_blocks = int(dense_first_blocks)
+        self.dense_block_set = frozenset(dense_block_set or ())
         self.sigma_hi = float(sigma_hi)
         self.sigma_lo = float(sigma_lo)
         self.sigma_span = max(self.sigma_hi - self.sigma_lo, 1e-8)
@@ -81,19 +135,28 @@ class _RoutingPolicy:
             self.last_sigma = sigma
             self.block_index = 0
 
-        index = self.block_index
-        self.block_index = (self.block_index + 1) % self.blocks_per_step
+        index = (transformer_options or {}).get(_BLOCK_INDEX_KEY)
+        if not isinstance(index, int):
+            # No block hook installed (or a model without .blocks): fall back to
+            # the old counter, which assumes one attention call per block.
+            index = self.block_index
+            self.block_index = (self.block_index + 1) % self.blocks_per_step
 
         if sigma is None:
             # Older ComfyUI builds do not publish sigma. Preserve performance
             # instead of accidentally treating every call as the first step.
-            progress = 1.0
+            progress = None
         else:
             progress = min(max((self.sigma_hi - sigma) / self.sigma_span, 0.0), 1.0)
+            if progress < self.dense_first_percent:
+                return False, "skipped_early", index, progress
+            if self.end_percent < 1.0 and progress >= self.end_percent:
+                return False, "skipped_late", index, progress
 
-        if progress < self.dense_first_percent:
-            return False, "skipped_early", index, progress
-        if index < self.dense_first_blocks:
+        if self.dense_block_set:
+            if index in self.dense_block_set:
+                return False, "skipped_block", index, progress
+        elif index < self.dense_first_blocks:
             return False, "skipped_block", index, progress
         return True, None, index, progress
 
@@ -122,9 +185,33 @@ def _capture_video_tokens(executor, x, timestep, context,
     )
 
 
+def _prefix_blocks(transformer_options, seq_len, manual):
+    """Number of leading 128-token blocks to keep exact.
+
+    Prefers the exact segment boundary the layout hooks publish; falls back to
+    deriving it from the video latent shape when they are unavailable.
+    """
+    from morton_h3 import VIDEO_SPAN_KEY
+
+    prefix_tokens = None
+    span = (transformer_options or {}).get(VIDEO_SPAN_KEY)
+    if (isinstance(span, (tuple, list)) and len(span) == 2
+            and 0 < int(span[0]) < seq_len):
+        prefix_tokens = int(span[0])
+    else:
+        video_tokens = (transformer_options or {}).get(_VIDEO_TOKENS_KEY)
+        if isinstance(video_tokens, int) and 0 < video_tokens <= seq_len:
+            prefix_tokens = seq_len - video_tokens
+
+    if prefix_tokens is None:
+        return manual
+    return max(manual, (prefix_tokens + FLEX_BLOCK - 1) // FLEX_BLOCK)
+
+
 def make_override(tau: float, min_seq_len: int, preserve_prefix_blocks: int,
                   log_every: int, policy: _RoutingPolicy,
                   protect_prefix: bool, dense_prefix_queries: bool,
+                  approx_correction: bool, cornish_fisher: bool,
                   fallback_override=None):
     def override(func, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -165,13 +252,7 @@ def make_override(tau: float, min_seq_len: int, preserve_prefix_blocks: int,
 
         prefix_blocks = int(preserve_prefix_blocks)
         if protect_prefix:
-            video_tokens = transformer_options.get(_VIDEO_TOKENS_KEY)
-            if isinstance(video_tokens, int) and 0 < video_tokens <= S:
-                prefix_tokens = S - video_tokens
-                prefix_blocks = max(
-                    prefix_blocks,
-                    (prefix_tokens + 127) // 128,
-                )
+            prefix_blocks = _prefix_blocks(transformer_options, S, prefix_blocks)
 
         try:
             out = sol_attn_flex(
@@ -180,6 +261,8 @@ def make_override(tau: float, min_seq_len: int, preserve_prefix_blocks: int,
                 tau=tau,
                 preserve_prefix_blocks=prefix_blocks,
                 dense_prefix_queries=dense_prefix_queries,
+                approx_correction=approx_correction,
+                cornish_fisher=cornish_fisher,
             )
         except Exception as exc:
             STATS["failed"] += 1
@@ -262,7 +345,54 @@ class SolAttnMiniMaxH3:
                     "default": 2, "min": 0, "max": 50, "step": 1,
                     "tooltip": "Use normal dense attention for the first N of "
                                "H3's 50 transformer blocks on every step. The "
-                               "reference H3 policy uses 2.",
+                               "reference H3 policy uses 2. Ignored when "
+                               "dense_blocks is set.",
+                }),
+                "end_percent": ("FLOAT", {
+                    "default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05,
+                    "tooltip": "Return to dense attention after this fraction of "
+                               "denoising. 1.0 disables. Try 0.9: the last steps "
+                               "set fine detail, where routing error is most "
+                               "visible.",
+                }),
+                "dense_blocks": ("STRING", {
+                    "default": "",
+                    "tooltip": "Transformer blocks to keep dense, e.g. '0-2,-1' "
+                               "for the first three and the last. Negative indices "
+                               "count from the end. Overrides dense_first_blocks. "
+                               "The first and last blocks are the most "
+                               "approximation-sensitive: their error reaches the "
+                               "output with no later block to absorb it.",
+                }),
+                "approx_correction": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Fold skipped blocks back in using the pilot scores "
+                               "routing already computed, instead of dropping them. "
+                               "This is Sol-Attn's long-tail correction step. Costs "
+                               "a few percent; usually pays for itself by letting "
+                               "you raise tau.",
+                }),
+                "cornish_fisher": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Correct the routing threshold for the skew and "
+                               "kurtosis of the score distribution instead of "
+                               "assuming it is Gaussian. Nearly free; changes which "
+                               "blocks are kept at a given tau, so re-tune tau.",
+                }),
+                "morton": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Reorder video tokens into Morton (Z-order) so each "
+                               "128-token block is a compact 3D neighbourhood "
+                               "instead of a thin 2-row strip of one frame. Exactly "
+                               "neutral for dense attention; makes routing far more "
+                               "accurate at a given density.",
+                }),
+                "morton_curve": (["2d_frame", "3d"], {
+                    "default": "2d_frame",
+                    "tooltip": "2d_frame Z-orders within each frame and leaves "
+                               "frame order alone -- correct for H3, whose frame "
+                               "spacing (1, 4, 4, 4, 4) is non-uniform. 3d "
+                               "interleaves t/h/w equally.",
                 }),
             },
         }
@@ -276,7 +406,9 @@ class SolAttnMiniMaxH3:
     def patch(self, model, enabled, tau, min_seq_len,
               preserve_prefix_blocks=0, log_every=200,
               protect_prefix=True, dense_prefix_queries=False,
-              dense_first_percent=0.2, dense_first_blocks=2):
+              dense_first_percent=0.2, dense_first_blocks=2,
+              end_percent=1.0, dense_blocks="", approx_correction=True,
+              cornish_fisher=False, morton=False, morton_curve="2d_frame"):
         if not enabled:
             return (model,)
 
@@ -293,11 +425,49 @@ class SolAttnMiniMaxH3:
         except Exception:
             sigma_hi, sigma_lo = 1.0, 0.0
 
+        # Layout hooks: publish the exact conditioning/video boundary, and
+        # optionally reorder the video span.  Needed for prefix protection even
+        # when Morton is off.
+        diffusion_model = None
+        try:
+            diffusion_model = patched.get_model_object("diffusion_model")
+        except Exception as exc:
+            logger.warning(f"[Sol-Attn] diffusion model unavailable "
+                           f"({type(exc).__name__}: {exc})")
+
+        n_blocks = 50
+        if diffusion_model is not None:
+            if protect_prefix or morton:
+                try:
+                    from morton_h3 import (install_h3_hooks, MORTON_KEY,
+                                           CURVE_KEY)
+                    install_h3_hooks(diffusion_model, block_size=FLEX_BLOCK)
+                    if morton:
+                        opts[MORTON_KEY] = True
+                        opts[CURVE_KEY] = morton_curve
+                except Exception as exc:
+                    logger.warning(
+                        f"[Sol-Attn] layout hooks unavailable "
+                        f"({type(exc).__name__}: {exc}); falling back to "
+                        f"latent-shape prefix estimation"
+                    )
+                    if morton:
+                        logger.warning("[Sol-Attn] Morton reordering skipped")
+            n_blocks = _install_block_index(diffusion_model) or n_blocks
+
+        dense_set = parse_blocks(dense_blocks, n_blocks)
+        if dense_set:
+            logger.info(f"[Sol-Attn] keeping blocks {sorted(dense_set)} of "
+                        f"{n_blocks} dense")
+
         policy = _RoutingPolicy(
             dense_first_percent=dense_first_percent,
+            end_percent=end_percent,
             dense_first_blocks=dense_first_blocks,
+            dense_block_set=dense_set,
             sigma_hi=sigma_hi,
             sigma_lo=sigma_lo,
+            blocks_per_step=n_blocks,
         )
         opts["optimized_attention_override"] = make_override(
             tau=tau, min_seq_len=min_seq_len,
@@ -306,6 +476,8 @@ class SolAttnMiniMaxH3:
             policy=policy,
             protect_prefix=protect_prefix,
             dense_prefix_queries=dense_prefix_queries,
+            approx_correction=approx_correction,
+            cornish_fisher=cornish_fisher,
             fallback_override=prior_override,
         )
         patched.model_options["transformer_options"] = opts
@@ -332,8 +504,10 @@ class SolAttnMiniMaxH3:
         logger.info(
             f"[Sol-Attn] patched | tau={tau} min_seq_len={min_seq_len} "
             f"protect_prefix={protect_prefix} "
-            f"dense_first={dense_first_percent:.0%} "
-            f"dense_blocks={dense_first_blocks}"
+            f"dense_first={dense_first_percent:.0%} end={end_percent:.0%} "
+            f"dense_blocks={sorted(dense_set) if dense_set else dense_first_blocks} "
+            f"correction={approx_correction} cf={cornish_fisher} "
+            f"morton={morton_curve if morton else False}"
         )
         return (patched,)
 
@@ -375,6 +549,7 @@ class SolAttnStats:
                f"skipped_short={STATS['skipped_short']} "
                f"skipped_shape={STATS['skipped_shape']} "
                f"skipped_early={STATS['skipped_early']} "
+               f"skipped_late={STATS['skipped_late']} "
                f"skipped_block={STATS['skipped_block']} "
                f"prefix_blocks={STATS['prefix_blocks']} "
                f"failed={STATS['failed']} "
