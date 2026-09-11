@@ -1,5 +1,8 @@
 # ComfyUI-SolAttn-Ampere
 
+add https://github.com/yoooooolx/comfyui-docker-build/blob/main/Dockerfile 
+
+
 Block-sparse attention for **MiniMax H3** on **Ampere and newer** (RTX 3090 / sm_80+).
 
 Sol-Attn routes attention at 128-token granularity — it mean-pools K and Q into blocks, scores them
